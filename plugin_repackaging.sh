@@ -9,476 +9,39 @@ GITHUB_API_URL="${GITHUB_API_URL:-$DEFAULT_GITHUB_API_URL}"
 MARKETPLACE_API_URL="${MARKETPLACE_API_URL:-$DEFAULT_MARKETPLACE_API_URL}"
 PIP_MIRROR_URL="${PIP_MIRROR_URL:-$DEFAULT_PIP_MIRROR_URL}"
 
-CURR_DIR=`dirname $0`
-cd $CURR_DIR || exit 1
-CURR_DIR=`pwd`
-USER=`whoami`
-ARCH_NAME=`uname -m`
-OS_TYPE=$(uname)
-OS_TYPE=$(echo "$OS_TYPE" | tr '[:upper:]' '[:lower:]')
+CURR_DIR=$(cd "$(dirname "$0")" && pwd)
+ARCH_NAME=$(uname -m)
+OS_TYPE=$(uname | tr '[:upper:]' '[:lower:]')
 
 CMD_NAME="dify-plugin-${OS_TYPE}-amd64"
-if [[ "arm64" == "$ARCH_NAME" || "aarch64" == "$ARCH_NAME" ]]; then
+if [[ "$ARCH_NAME" == "arm64" || "$ARCH_NAME" == "aarch64" ]]; then
 	CMD_NAME="dify-plugin-${OS_TYPE}-arm64"
 fi
 
-# Cross packaging / resolution controls
 PIP_PLATFORM_ARGS=""
-RAW_PLATFORM=""    # raw value from -p, e.g. manylinux2014_x86_64
+RAW_PLATFORM=""
 PACKAGE_SUFFIX="offline"
 PRERELEASE_ALLOW=0
 
-market(){
-	if [[ -z "$2" || -z "$3" || -z "$4" ]]; then
-		echo ""
-		echo "Usage: "$0" market [plugin author] [plugin name] [plugin version]"
-		echo "Example:"
-		echo "\t"$0" market junjiem mcp_sse 0.0.1"
-		echo "\t"$0" market langgenius agent 0.0.9"
-		echo ""
-		exit 1
-	fi
-	PLUGIN_AUTHOR=$2
-	PLUGIN_NAME=$3
-	PLUGIN_VERSION=$4
-	PLUGIN_PACKAGE_PATH=${CURR_DIR}/${PLUGIN_AUTHOR}-${PLUGIN_NAME}_${PLUGIN_VERSION}.difypkg
-	PLUGIN_DOWNLOAD_URL=${MARKETPLACE_API_URL}/api/v1/plugins/${PLUGIN_AUTHOR}/${PLUGIN_NAME}/${PLUGIN_VERSION}/download
-
-	echo ""
-	echo "=========================================="
-	echo "Downloading from Dify Marketplace"
-	echo "=========================================="
-	echo "Author: ${PLUGIN_AUTHOR}"
-	echo "Plugin: ${PLUGIN_NAME}"
-	echo "Version: ${PLUGIN_VERSION}"
-	echo "URL: ${PLUGIN_DOWNLOAD_URL}"
-
-	curl -L -o ${PLUGIN_PACKAGE_PATH} ${PLUGIN_DOWNLOAD_URL}
-	if [[ $? -ne 0 ]]; then
-		echo "✗ Error: Download failed"
-		echo "  Please check the plugin author, name, and version"
-		exit 1
-	fi
-
-	DOWNLOADED_SIZE=$(du -h "${PLUGIN_PACKAGE_PATH}" | cut -f1)
-	echo "✓ Downloaded successfully (${DOWNLOADED_SIZE})"
-
-	repackage ${PLUGIN_PACKAGE_PATH}
+print_usage() {
+	echo "usage: $0 [-p platform] [-s package_suffix] [-R] {market|github|local}"
+	echo "-p platform: target Python wheel platform, e.g. manylinux2014_x86_64 or manylinux2014_aarch64"
+	echo "-s package_suffix: output suffix, e.g. linux-amd64 or linux-arm64"
+	echo "-R: allow pre-release versions during uv resolution"
+	exit 1
 }
 
-github(){
-	if [[ -z "$2" || -z "$3" || -z "$4" ]]; then
-		echo ""
-		echo "Usage: "$0" github [Github repo] [Release title] [Assets name (include .difypkg suffix)]"
-		echo "Example:"
-		echo "\t"$0" github junjiem/dify-plugin-tools-dbquery v0.0.2 db_query.difypkg"
-		echo "\t"$0" github https://github.com/junjiem/dify-plugin-agent-mcp_sse 0.0.1 agent-mcp_see.difypkg"
-		echo ""
-		exit 1
-	fi
-	GITHUB_REPO=$2
-	if [[ "${GITHUB_REPO}" != "${GITHUB_API_URL}"* ]]; then
-		GITHUB_REPO="${GITHUB_API_URL}/${GITHUB_REPO}"
-	fi
-	RELEASE_TITLE=$3
-	ASSETS_NAME=$4
-	PLUGIN_NAME="${ASSETS_NAME%.difypkg}"
-	PLUGIN_PACKAGE_PATH=${CURR_DIR}/${PLUGIN_NAME}-${RELEASE_TITLE}.difypkg
-	PLUGIN_DOWNLOAD_URL=${GITHUB_REPO}/releases/download/${RELEASE_TITLE}/${ASSETS_NAME}
-
-	echo ""
-	echo "=========================================="
-	echo "Downloading from GitHub"
-	echo "=========================================="
-	echo "Repository: ${GITHUB_REPO}"
-	echo "Release: ${RELEASE_TITLE}"
-	echo "Asset: ${ASSETS_NAME}"
-	echo "URL: ${PLUGIN_DOWNLOAD_URL}"
-
-	curl -L -o ${PLUGIN_PACKAGE_PATH} ${PLUGIN_DOWNLOAD_URL}
-	if [[ $? -ne 0 ]]; then
-		echo "✗ Error: Download failed"
-		echo "  Please check the GitHub repo, release title, and asset name"
-		exit 1
+install_unzip() {
+	if command -v unzip >/dev/null 2>&1; then
+		return 0
 	fi
 
-	DOWNLOADED_SIZE=$(du -h "${PLUGIN_PACKAGE_PATH}" | cut -f1)
-	echo "✓ Downloaded successfully (${DOWNLOADED_SIZE})"
-
-	repackage ${PLUGIN_PACKAGE_PATH}
+	echo "unzip not found; please install unzip first."
+	exit 1
 }
 
-_local(){
-	echo $2
-	if [[ -z "$2" ]]; then
-		echo ""
-		echo "Usage: "$0" local [difypkg path]"
-		echo "Example:"
-		echo "\t"$0" local ./db_query.difypkg"
-		echo "\t"$0" local /root/dify-plugin/db_query.difypkg"
-		echo ""
-		exit 1
-	fi
-	PLUGIN_PACKAGE_PATH=`realpath $2`
-	repackage ${PLUGIN_PACKAGE_PATH}
-}
-
-repackage(){
-	local PACKAGE_PATH=$1
-	PACKAGE_NAME_WITH_EXTENSION=`basename ${PACKAGE_PATH}`
-	PACKAGE_NAME="${PACKAGE_NAME_WITH_EXTENSION%.*}"
-
-	echo ""
-	echo "=========================================="
-	echo "Dify Plugin Repackaging Tool"
-	echo "=========================================="
-	echo "Source: ${PACKAGE_PATH}"
-	echo "Work directory: ${CURR_DIR}/${PACKAGE_NAME}"
-
-	# Extract plugin package
-	echo ""
-	echo "Extracting plugin package..."
-	install_unzip
-	unzip -o ${PACKAGE_PATH} -d ${CURR_DIR}/${PACKAGE_NAME}
-	if [[ $? -ne 0 ]]; then
-		echo "✗ Error: Failed to extract package"
-		exit 1
-	fi
-	echo "✓ Package extracted successfully"
-
-	cd ${CURR_DIR}/${PACKAGE_NAME} || exit 1
-	if [ ! -f "pyproject.toml" ] && [ ! -f "requirements.txt" ]; then
-		echo "⚠ Warning: No pyproject.toml or requirements.txt found"
-	fi
-
-	# Remove development-only dependency groups before uv resolves the plugin.
-	# Dify plugin-daemon can still consider dependency-groups during offline
-	# solving even when the runtime command uses `uv sync --no-dev`.
-	strip_dependency_groups() {
-		local PYFILE="$1"
-		[ -f "$PYFILE" ] || return 0
-
-		if ! grep -qE '^[[:space:]]*\[dependency-groups\][[:space:]]*$' "$PYFILE"; then
-			return 0
-		fi
-
-		echo "Removing [dependency-groups] from $PYFILE for offline runtime..."
-		python3 - "$PYFILE" <<'PYEOF'
-from pathlib import Path
-import re
-import sys
-
-path = Path(sys.argv[1])
-lines = path.read_text().splitlines(keepends=True)
-out = []
-inside_dependency_groups = False
-
-for line in lines:
-    stripped = line.strip()
-
-    if re.fullmatch(r"\[dependency-groups\]", stripped):
-        inside_dependency_groups = True
-        continue
-
-    # Any new TOML table ends [dependency-groups].
-    if inside_dependency_groups and re.match(r"^\s*\[", line):
-        inside_dependency_groups = False
-
-    if not inside_dependency_groups:
-        out.append(line)
-
-path.write_text("".join(out))
-PYEOF
-		if [[ $? -ne 0 ]]; then
-			echo "✗ Error: Failed to remove [dependency-groups] from $PYFILE"
-			exit 1
-		fi
-		echo "✓ Removed [dependency-groups]"
-	}
-
-	# Inject [tool.uv] config into pyproject.toml (runtime will use local wheels offline)
-	inject_uv_into_pyproject() {
-		local PYFILE="$1"
-		[ -f "$PYFILE" ] || return 0
-	awk '
-		BEGIN { in_uv=0; saw_uv=0; saw_no=0; saw_find=0; saw_pre=0 }
-		function print_missing(){ if (!saw_no) print "no-index = true"; if (!saw_find) print "find-links = [\"./wheels\"]"; if (!saw_pre) print "prerelease = \"allow\"" }
-		/^[ \t]*\[tool\.uv\][ \t]*$/ { saw_uv=1; in_uv=1; saw_no=0; saw_find=0; saw_pre=0; print; next }
-		{ if (in_uv && $0 ~ /^[ \t]*\[/) { print_missing(); in_uv=0 } }
-		{ if (in_uv && $0 ~ /^[ \t]*no-index[ \t]*=/) { print "no-index = true"; saw_no=1; next } }
-		{ if (in_uv && $0 ~ /^[ \t]*find-links[ \t]*=/) { print "find-links = [\"./wheels\"]"; saw_find=1; next } }
-		{ if (in_uv && $0 ~ /^[ \t]*prerelease[ \t]*=/) { print "prerelease = \"allow\""; saw_pre=1; next } }
-		{ print }
-		END {
-			if (in_uv) { print_missing() }
-			if (!saw_uv) {
-				print ""
-				print "[tool.uv]"
-				print "no-index = true"
-				print "find-links = [\"./wheels\"]"
-				print "prerelease = \"allow\""
-			}
-		}
-		' "$PYFILE" > "$PYFILE.tmp" && mv "$PYFILE.tmp" "$PYFILE"
-		echo "Injected [tool.uv] into $PYFILE"
-	}
-
-	if python3 -m pip --version &> /dev/null 2>&1; then
-		PIP_CMD="python3 -m pip"
-	elif command -v pip &> /dev/null && pip --version &> /dev/null 2>&1; then
-		PIP_CMD=pip
-	elif command -v pip3 &> /dev/null && pip3 --version &> /dev/null 2>&1; then
-		PIP_CMD=pip3
-	else
-		echo "pip not found. Install: python3 -m ensurepip --upgrade"
-		exit 1
-	fi
-	echo "✓ Using pip: ${PIP_CMD}"
-
-	# ============================================
-	# Step 1: Detect Python and platform configuration
-	# ============================================
-	echo ""
-	echo "=========================================="
-	echo "Step 1: Detecting Python and platform"
-	echo "=========================================="
-
-	# Detect Python version
-	PYTHON_CMD_FOR_UV="python3"
-	PY_VERSION_FULL=$(python3 --version 2>&1 | awk '{print $2}')
-	PY_MAJOR=$(echo $PY_VERSION_FULL | cut -d. -f1)
-	PY_MINOR=$(echo $PY_VERSION_FULL | cut -d. -f2)
-	PYTHON_VERSION=$PY_VERSION_FULL
-
-	echo "Detected Python: $PYTHON_VERSION"
-
-	# If Python is 3.14+, try to use 3.12 or 3.13 for better compatibility
-	if [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -ge 14 ]; then
-		echo "⚠ Warning: Python $PYTHON_VERSION is too new for some packages"
-		if command -v python3.12 &> /dev/null; then
-			PYTHON_CMD_FOR_UV="python3.12"
-			PYTHON_VERSION=$($PYTHON_CMD_FOR_UV --version 2>&1 | awk '{print $2}')
-			echo "✓ Switched to python3.12 ($PYTHON_VERSION) for better compatibility"
-		elif command -v python3.13 &> /dev/null; then
-			PYTHON_CMD_FOR_UV="python3.13"
-			PYTHON_VERSION=$($PYTHON_CMD_FOR_UV --version 2>&1 | awk '{print $2}')
-			echo "✓ Switched to python3.13 ($PYTHON_VERSION) for better compatibility"
-		else
-			echo "⚠ Warning: No compatible Python version found, proceeding with $PYTHON_VERSION"
-		fi
-	else
-		echo "✓ Python version $PYTHON_VERSION is compatible"
-	fi
-
-	# Extract Python major.minor for uv
-	UV_PY_VERSION=$($PYTHON_CMD_FOR_UV - <<'PY'
-import sys
-print(f"{sys.version_info.major}.{sys.version_info.minor}")
-PY
-)
-
-	# Determine uv target platform to avoid cross-platform dependency conflicts
-	local UV_PLATFORM=""
-	if [[ -n "$RAW_PLATFORM" ]]; then
-		case "$RAW_PLATFORM" in
-			*linux*|*manylinux* )
-				UV_PLATFORM="linux"
-				echo "Target platform: Linux (cross-compilation from $OS_TYPE)"
-				;;
-			*macos*|*darwin* )
-				UV_PLATFORM="macos"
-				echo "Target platform: macOS (cross-compilation from $OS_TYPE)"
-				;;
-			*win* )
-				UV_PLATFORM="windows"
-				echo "Target platform: Windows (cross-compilation from $OS_TYPE)"
-				;;
-			* )
-				UV_PLATFORM=""
-				echo "Target platform: current ($OS_TYPE)"
-				;;
-		esac
-	else
-		if [[ "$OS_TYPE" == "darwin" ]]; then
-			UV_PLATFORM="macos"
-		elif [[ "$OS_TYPE" == "linux" ]]; then
-			UV_PLATFORM="linux"
-		elif [[ "$OS_TYPE" == "windows" ]]; then
-			UV_PLATFORM="windows"
-		fi
-		echo "Target platform: $UV_PLATFORM (current system)"
-	fi
-
-	# Set prerelease flag
-	UV_PRERELEASE_FLAG=""
-	if [[ "$PRERELEASE_ALLOW" -eq 1 ]]; then
-		UV_PRERELEASE_FLAG="--prerelease=allow"
-		echo "Prerelease versions: allowed"
-	else
-		echo "Prerelease versions: disallowed"
-	fi
-
-	echo "✓ Configuration: platform=${UV_PLATFORM:-current}, python=$UV_PY_VERSION"
-
-	# ============================================
-	# Step 2: Generate requirements.txt from pyproject.toml
-	# ============================================
-	echo ""
-	echo "=========================================="
-	echo "Step 2: Processing dependencies"
-	echo "=========================================="
-
-	# Prepare pyproject.toml for a runtime-only, offline uv environment.
-	if [ -f "pyproject.toml" ]; then
-		echo "Found pyproject.toml, preparing for offline runtime..."
-		strip_dependency_groups "pyproject.toml"
-		inject_uv_into_pyproject "pyproject.toml"
-	fi
-
-	if [ -f "pyproject.toml" ] && [ ! -f "requirements.txt" ]; then
-		if command -v uv &> /dev/null; then
-			echo "Generating uv.lock file..."
-			uv lock ${UV_PLATFORM:+--python-platform ${UV_PLATFORM}} \
-				--python-version "${UV_PY_VERSION}" ${UV_PRERELEASE_FLAG}
-			if [[ $? -ne 0 ]]; then
-				echo "✗ Error: uv lock failed"
-				exit 1
-			fi
-			echo "✓ uv.lock generated successfully"
-
-			echo "Exporting requirements.txt from uv.lock..."
-			uv export --format requirements-txt -o requirements.txt \
-				${UV_PLATFORM:+--python-platform ${UV_PLATFORM}} \
-				--python-version "${UV_PY_VERSION}" ${UV_PRERELEASE_FLAG}
-			if [[ $? -ne 0 ]]; then
-				echo "✗ Error: uv export failed"
-				exit 1
-			fi
-			echo "✓ requirements.txt generated successfully"
-		else
-			echo "✗ Error: pyproject.toml found but uv is not installed"
-			echo "  Please install uv: pip install uv"
-			echo "  Or commit requirements.txt with the plugin"
-			exit 1
-		fi
-	elif [ -f "requirements.txt" ]; then
-		echo "✓ Using existing requirements.txt"
-	fi
-
-	[ ! -f "requirements.txt" ] && echo "✗ Error: requirements.txt not found" && exit 1
-
-	# ============================================
-	# Step 3: Download Python dependencies as wheels
-	# ============================================
-	echo ""
-	echo "=========================================="
-	echo "Step 3: Downloading dependencies"
-	echo "=========================================="
-	echo "Index URL: ${PIP_MIRROR_URL}"
-	[ -n "$PIP_PLATFORM_ARGS" ] && echo "Platform: ${RAW_PLATFORM}"
-
-	mkdir -p ./wheels
-	echo "Downloading prebuilt wheels to ./wheels/..."
-	${PIP_CMD} download ${PIP_PLATFORM_ARGS} --only-binary=:all: --prefer-binary -r requirements.txt -d ./wheels \
-		--index-url ${PIP_MIRROR_URL} --trusted-host mirrors.aliyun.com
-	if [[ $? -ne 0 ]]; then
-		if is_native_target; then
-			echo "⚠ Prebuilt wheels are unavailable for one or more dependencies."
-			echo "Building missing dependencies from source on the native platform..."
-			# Clear pip platform env vars so source builds are not treated as cross-compilation.
-			env -u PIP_PLATFORM ${PIP_CMD} wheel --wheel-dir ./wheels --prefer-binary -r requirements.txt \
-				--index-url ${PIP_MIRROR_URL} --trusted-host mirrors.aliyun.com
-			if [[ $? -ne 0 ]]; then
-				echo "✗ Error: Failed to build dependency wheels"
-				echo "  Install the package build prerequisites and retry."
-				echo "  Rust extensions such as jiter require rust/cargo, a C compiler, and Python development headers."
-				exit 1
-			fi
-		else
-			echo "✗ Error: Prebuilt wheels are unavailable for target platform ${RAW_PLATFORM}."
-			echo "  Cross-platform builds are not supported because compiled wheels must be built on the target OS and CPU architecture."
-			echo "  Run this script on a native ${RAW_PLATFORM} environment, then retry."
-			exit 1
-		fi
-	fi
-
-	# Count downloaded wheels
-	WHEEL_COUNT=$(ls -1 ./wheels/*.whl 2>/dev/null | wc -l)
-	echo "✓ Downloaded $WHEEL_COUNT wheel packages"
-
-	# ============================================
-	# Step 4: Update requirements.txt for offline usage
-	# ============================================
-	echo ""
-	echo "Updating requirements.txt for offline installation..."
-	if [[ "linux" == "$OS_TYPE" ]]; then
-		sed -i '1i\--no-index --find-links=./wheels/' requirements.txt
-		[ -f ".difyignore" ] && IGNORE_PATH=.difyignore || IGNORE_PATH=.gitignore
-		[ -f "$IGNORE_PATH" ] && sed -i '/^wheels\//d' "${IGNORE_PATH}"
-	elif [[ "darwin" == "$OS_TYPE" ]]; then
-		sed -i ".bak" '1i\--no-index --find-links=./wheels/' requirements.txt && rm -f requirements.txt.bak
-		[ -f ".difyignore" ] && IGNORE_PATH=.difyignore || IGNORE_PATH=.gitignore
-		[ -f "$IGNORE_PATH" ] && sed -i ".bak" '/^wheels\//d' "${IGNORE_PATH}" && rm -f "${IGNORE_PATH}.bak"
-	fi
-	echo "✓ requirements.txt updated for offline mode"
-
-	# uv.lock can contain PyPI source metadata/URLs and may cause the daemon to
-	# re-resolve dependency groups. The offline package should resolve only from
-	# the bundled wheels and the sanitized pyproject.toml.
-	if [ -f "uv.lock" ]; then
-		echo "Removing uv.lock for offline runtime..."
-		rm -f uv.lock
-		echo "✓ uv.lock removed"
-	fi
-
-	# ============================================
-	# Step 5: Package the plugin
-	# ============================================
-	echo ""
-	echo "=========================================="
-	echo "Step 5: Packaging plugin"
-	echo "=========================================="
-
-	cd ${CURR_DIR} || exit 1
-	chmod 755 ${CURR_DIR}/${CMD_NAME}
-
-	OUTPUT_PACKAGE="${CURR_DIR}/${PACKAGE_NAME}-${PACKAGE_SUFFIX}.difypkg"
-	echo "Packaging: ${PACKAGE_NAME}"
-	echo "Output: ${OUTPUT_PACKAGE}"
-	echo "Max size: 5120 MB"
-
-	${CURR_DIR}/${CMD_NAME} plugin package ${CURR_DIR}/${PACKAGE_NAME} \
-		-o ${OUTPUT_PACKAGE} --max-size 5120
-	if [[ $? -ne 0 ]]; then
-		echo "✗ Error: Packaging failed"
-		exit 1
-	fi
-
-	# Get file size
-	FILE_SIZE=$(du -h "${OUTPUT_PACKAGE}" | cut -f1)
-	echo ""
-	echo "=========================================="
-	echo "✓ Package created successfully!"
-	echo "=========================================="
-	echo "Location: ${OUTPUT_PACKAGE}"
-	echo "Size: ${FILE_SIZE}"
-	echo "Platform: ${RAW_PLATFORM:-current}"
-}
-
-install_unzip(){
-	if ! command -v unzip &> /dev/null; then
-		echo "Installing unzip ..."
-		yum -y install unzip
-		if [ $? -ne 0 ]; then
-			echo "Install unzip failed."
-			exit 1
-		fi
-	fi
-}
-
-# Return success only when a source build produces wheels for the requested target.
-is_native_target(){
-	local TARGET_ARCH=""
+is_native_target() {
+	local target_arch=""
 
 	if [[ -z "$RAW_PLATFORM" ]]; then
 		return 0
@@ -491,53 +54,365 @@ is_native_target(){
 	esac
 
 	case "$RAW_PLATFORM" in
-		*aarch64*|*arm64*) TARGET_ARCH="arm64" ;;
-		*x86_64*|*amd64*) TARGET_ARCH="amd64" ;;
+		*aarch64*|*arm64*) target_arch="arm64" ;;
+		*x86_64*|*amd64*) target_arch="amd64" ;;
 		*) return 1 ;;
 	esac
 
-	if [[ "$TARGET_ARCH" == "arm64" ]]; then
+	if [[ "$target_arch" == "arm64" ]]; then
 		[[ "$ARCH_NAME" == "aarch64" || "$ARCH_NAME" == "arm64" ]]
 	else
 		[[ "$ARCH_NAME" == "x86_64" || "$ARCH_NAME" == "amd64" ]]
 	fi
 }
 
-print_usage() {
-	echo "usage: $0 [-p platform] [-s package_suffix] [-R] {market|github|local}"
-	echo "-p platform: python packages' platform. Using for crossing repacking.
-        For example: -p manylinux2014_x86_64 or -p manylinux2014_aarch64"
-	echo "-s package_suffix: The suffix name of the output offline package.
-        For example: -s linux-amd64 or -s linux-arm64"
-	echo "-R: allow pre-release versions during uv resolution (maps to --prerelease=allow)"
-	exit 1
+strip_dependency_groups() {
+	local pyfile="$1"
+	[[ -f "$pyfile" ]] || return 0
+
+	if ! grep -qE '^[[:space:]]*\[dependency-groups\][[:space:]]*$' "$pyfile"; then
+		return 0
+	fi
+
+	echo "Removing [dependency-groups] from $pyfile..."
+	python3 - "$pyfile" <<'PYEOF'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines(keepends=True)
+out = []
+in_group = False
+
+for line in lines:
+    stripped = line.strip()
+    if re.fullmatch(r"\[dependency-groups\]", stripped):
+        in_group = True
+        continue
+    if in_group and re.match(r"^\s*\[", line):
+        in_group = False
+    if not in_group:
+        out.append(line)
+
+path.write_text("".join(out))
+PYEOF
+	if [[ $? -ne 0 ]]; then
+		echo "✗ Error: failed to remove [dependency-groups]"
+		exit 1
+	fi
+	echo "✓ Removed [dependency-groups]"
+}
+
+sanitize_requirements_for_download() {
+	local reqfile="$1"
+	python3 - "$reqfile" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines()
+cleaned = []
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("--no-index"):
+        continue
+    if stripped.startswith("--find-links") or stripped.startswith("-f "):
+        continue
+    cleaned.append(line)
+path.write_text("\n".join(cleaned).rstrip() + "\n")
+PYEOF
+}
+
+make_requirements_offline() {
+	local reqfile="$1"
+	python3 - "$reqfile" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines()
+lines = [line for line in lines if not line.strip().startswith("--no-index") and not line.strip().startswith("--find-links")]
+path.write_text("--no-index --find-links=./wheels/\n" + "\n".join(lines).rstrip() + "\n")
+PYEOF
+}
+
+ensure_wheels_in_package() {
+	local ignore_path=""
+	if [[ -f .difyignore ]]; then
+		ignore_path=.difyignore
+	elif [[ -f .gitignore ]]; then
+		ignore_path=.gitignore
+	fi
+
+	if [[ -n "$ignore_path" ]]; then
+		python3 - "$ignore_path" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines()
+kept = []
+for line in lines:
+    normalized = line.strip().lstrip("/")
+    if normalized in {"wheels", "wheels/", "requirements.txt"}:
+        continue
+    kept.append(line)
+path.write_text("\n".join(kept).rstrip() + "\n")
+PYEOF
+	fi
+}
+
+market() {
+	if [[ -z "$2" || -z "$3" || -z "$4" ]]; then
+		echo "Usage: $0 market [plugin author] [plugin name] [plugin version]"
+		exit 1
+	fi
+
+	local plugin_author="$2"
+	local plugin_name="$3"
+	local plugin_version="$4"
+	local package_path="${CURR_DIR}/${plugin_author}-${plugin_name}_${plugin_version}.difypkg"
+	local download_url="${MARKETPLACE_API_URL}/api/v1/plugins/${plugin_author}/${plugin_name}/${plugin_version}/download"
+
+	echo "Downloading ${plugin_author}/${plugin_name}:${plugin_version} from Dify Marketplace..."
+	curl -fL -o "$package_path" "$download_url" || {
+		echo "✗ Error: download failed: $download_url"
+		exit 1
+	}
+
+	repackage "$package_path"
+}
+
+github() {
+	if [[ -z "$2" || -z "$3" || -z "$4" ]]; then
+		echo "Usage: $0 github [GitHub repo] [release title] [asset name]"
+		exit 1
+	fi
+
+	local github_repo="$2"
+	local release_title="$3"
+	local asset_name="$4"
+	if [[ "$github_repo" != "$GITHUB_API_URL"* ]]; then
+		github_repo="${GITHUB_API_URL}/${github_repo}"
+	fi
+
+	local plugin_name="${asset_name%.difypkg}"
+	local package_path="${CURR_DIR}/${plugin_name}-${release_title}.difypkg"
+	local download_url="${github_repo}/releases/download/${release_title}/${asset_name}"
+
+	echo "Downloading ${download_url}..."
+	curl -fL -o "$package_path" "$download_url" || {
+		echo "✗ Error: download failed: $download_url"
+		exit 1
+	}
+
+	repackage "$package_path"
+}
+
+_local() {
+	if [[ -z "$2" ]]; then
+		echo "Usage: $0 local [difypkg path]"
+		exit 1
+	fi
+
+	local package_path
+	package_path=$(realpath "$2")
+	repackage "$package_path"
+}
+
+repackage() {
+	local package_path="$1"
+	local package_file
+	local package_name
+	package_file=$(basename "$package_path")
+	package_name="${package_file%.*}"
+	local work_dir="${CURR_DIR}/${package_name}"
+
+	echo ""
+	echo "=========================================="
+	echo "Dify Plugin Repackaging Tool"
+	echo "=========================================="
+	echo "Source: $package_path"
+	echo "Work directory: $work_dir"
+
+	install_unzip
+	rm -rf "$work_dir"
+	mkdir -p "$work_dir"
+	unzip -oq "$package_path" -d "$work_dir" || {
+		echo "✗ Error: failed to extract package"
+		exit 1
+	}
+	cd "$work_dir" || exit 1
+
+	if [[ ! -f pyproject.toml && ! -f requirements.txt ]]; then
+		echo "✗ Error: no pyproject.toml or requirements.txt found"
+		exit 1
+	fi
+
+	if python3 -m pip --version >/dev/null 2>&1; then
+		PIP_CMD="python3 -m pip"
+	elif command -v pip3 >/dev/null 2>&1; then
+		PIP_CMD="pip3"
+	elif command -v pip >/dev/null 2>&1; then
+		PIP_CMD="pip"
+	else
+		echo "✗ Error: pip not found"
+		exit 1
+	fi
+
+	PYTHON_CMD_FOR_UV="python3"
+	PY_VERSION_FULL=$(python3 --version 2>&1 | awk '{print $2}')
+	PY_MAJOR=$(echo "$PY_VERSION_FULL" | cut -d. -f1)
+	PY_MINOR=$(echo "$PY_VERSION_FULL" | cut -d. -f2)
+	if [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge 14 ]]; then
+		if command -v python3.12 >/dev/null 2>&1; then
+			PYTHON_CMD_FOR_UV="python3.12"
+		elif command -v python3.13 >/dev/null 2>&1; then
+			PYTHON_CMD_FOR_UV="python3.13"
+		fi
+	fi
+
+	UV_PY_VERSION=$($PYTHON_CMD_FOR_UV - <<'PYEOF'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PYEOF
+)
+
+	local uv_platform=""
+	if [[ -n "$RAW_PLATFORM" ]]; then
+		case "$RAW_PLATFORM" in
+			*linux*|*manylinux*) uv_platform="linux" ;;
+			*macos*|*darwin*) uv_platform="macos" ;;
+			*win*) uv_platform="windows" ;;
+		esac
+	fi
+
+	local uv_prerelease_flag=""
+	if [[ "$PRERELEASE_ALLOW" -eq 1 ]]; then
+		uv_prerelease_flag="--prerelease=allow"
+	fi
+
+	echo "Target platform: ${RAW_PLATFORM:-current}"
+	echo "Dependency Python: $UV_PY_VERSION"
+
+	# Keep pyproject only long enough to derive runtime requirements. Development
+	# groups are removed because plugin-daemon/uv can otherwise resolve them even
+	# when the daemon invokes `uv sync --no-dev`.
+	if [[ -f pyproject.toml ]]; then
+		strip_dependency_groups pyproject.toml
+	fi
+
+	if [[ ! -f requirements.txt ]]; then
+		if ! command -v uv >/dev/null 2>&1; then
+			echo "✗ Error: pyproject.toml exists without requirements.txt, but uv is not installed"
+			echo "  Install uv first: python3 -m pip install uv"
+			exit 1
+		fi
+
+		echo "Generating runtime requirements.txt from pyproject.toml..."
+		# Remove an old lock after changing dependency groups, then resolve online on
+		# the packaging host. The generated lock is only an intermediate artifact.
+		rm -f uv.lock
+		uv lock ${uv_platform:+--python-platform "$uv_platform"} \
+			--python-version "$UV_PY_VERSION" $uv_prerelease_flag || {
+			echo "✗ Error: uv lock failed"
+			exit 1
+		}
+		uv export --format requirements-txt --no-dev --no-hashes -o requirements.txt \
+			${uv_platform:+--python-platform "$uv_platform"} \
+			--python-version "$UV_PY_VERSION" $uv_prerelease_flag || {
+			echo "✗ Error: uv export failed"
+			exit 1
+		}
+	fi
+
+	# An input may itself be an already-repacked package. Remove offline pip flags
+	# before downloading so the connected packaging host can resolve dependencies.
+	sanitize_requirements_for_download requirements.txt
+
+	rm -rf wheels
+	mkdir -p wheels
+	echo "Downloading runtime wheels..."
+	$PIP_CMD download $PIP_PLATFORM_ARGS --only-binary=:all: --prefer-binary \
+		-r requirements.txt -d ./wheels \
+		--index-url "$PIP_MIRROR_URL" --trusted-host mirrors.aliyun.com
+	if [[ $? -ne 0 ]]; then
+		if is_native_target; then
+			echo "Prebuilt wheel unavailable; attempting a native source build..."
+			env -u PIP_PLATFORM $PIP_CMD wheel --wheel-dir ./wheels --prefer-binary \
+			-r requirements.txt --index-url "$PIP_MIRROR_URL" \
+			--trusted-host mirrors.aliyun.com || {
+				echo "✗ Error: failed to build dependency wheels"
+				exit 1
+			}
+		else
+			echo "✗ Error: a required wheel is unavailable for $RAW_PLATFORM"
+			echo "  Run the packaging script on the target OS/CPU architecture and retry."
+			exit 1
+		fi
+	fi
+
+	WHEEL_COUNT=$(find ./wheels -maxdepth 1 -type f -name '*.whl' | wc -l | tr -d ' ')
+	echo "✓ Downloaded $WHEEL_COUNT wheel packages"
+
+	make_requirements_offline requirements.txt
+	ensure_wheels_in_package
+
+	# IMPORTANT for air-gapped Dify 1.17/plugin-daemon:
+	# If pyproject.toml is present, daemon prefers project mode (`uv sync`). When
+	# no lock is usable, uv performs universal/project resolution and may require
+	# dependencies for non-target platforms (for example win32 cffi from gevent),
+	# even though the daemon itself is running on Linux. Force requirements mode
+	# instead: daemon then uses `uv pip install -r requirements.txt`, whose local
+	# find-links points only at the bundled target-platform wheels.
+	if [[ -f pyproject.toml ]]; then
+		echo "Removing pyproject.toml from final offline package to force requirements mode..."
+		rm -f pyproject.toml
+	fi
+	if [[ -f uv.lock ]]; then
+		echo "Removing uv.lock from final offline package..."
+		rm -f uv.lock
+	fi
+
+	cd "$CURR_DIR" || exit 1
+	if [[ ! -x "${CURR_DIR}/${CMD_NAME}" ]]; then
+		chmod 755 "${CURR_DIR}/${CMD_NAME}" 2>/dev/null || true
+	fi
+	if [[ ! -x "${CURR_DIR}/${CMD_NAME}" ]]; then
+		echo "✗ Error: packaging CLI not found or not executable: ${CURR_DIR}/${CMD_NAME}"
+		exit 1
+	fi
+
+	OUTPUT_PACKAGE="${CURR_DIR}/${package_name}-${PACKAGE_SUFFIX}.difypkg"
+	echo "Packaging: $OUTPUT_PACKAGE"
+	"${CURR_DIR}/${CMD_NAME}" plugin package "$work_dir" \
+		-o "$OUTPUT_PACKAGE" --max-size 5120 || {
+		echo "✗ Error: packaging failed"
+		exit 1
+	}
+
+	FILE_SIZE=$(du -h "$OUTPUT_PACKAGE" | cut -f1)
+	echo ""
+	echo "✓ Package created successfully"
+	echo "Location: $OUTPUT_PACKAGE"
+	echo "Size: $FILE_SIZE"
+	echo "Runtime dependency mode: requirements.txt + bundled wheels"
 }
 
 while getopts "p:s:R" opt; do
 	case "$opt" in
-		p) RAW_PLATFORM="${OPTARG}"; PIP_PLATFORM_ARGS="--platform ${OPTARG}" ;;
-		s) PACKAGE_SUFFIX="${OPTARG}" ;;
+		p) RAW_PLATFORM="$OPTARG"; PIP_PLATFORM_ARGS="--platform $OPTARG" ;;
+		s) PACKAGE_SUFFIX="$OPTARG" ;;
 		R) PRERELEASE_ALLOW=1 ;;
-		*) print_usage; exit 1 ;;
+		*) print_usage ;;
 	esac
 done
-
 shift $((OPTIND - 1))
 
-echo "$1"
-case "$1" in
-	'market')
-	market $@
-	;;
-	'github')
-	github $@
-	;;
-	'local')
-	_local $@
-	;;
-	*)
-	print_usage
-	exit 1
-	;;
+case "${1:-}" in
+	market) market "$@" ;;
+	github) github "$@" ;;
+	local) _local "$@" ;;
+	*) print_usage ;;
 esac
-exit 0
