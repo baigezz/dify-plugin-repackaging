@@ -33,8 +33,8 @@ market(){
 		echo ""
 		echo "Usage: "$0" market [plugin author] [plugin name] [plugin version]"
 		echo "Example:"
-		echo "	"$0" market junjiem mcp_sse 0.0.1"
-		echo "	"$0" market langgenius agent 0.0.9"
+		echo "\t"$0" market junjiem mcp_sse 0.0.1"
+		echo "\t"$0" market langgenius agent 0.0.9"
 		echo ""
 		exit 1
 	fi
@@ -71,8 +71,8 @@ github(){
 		echo ""
 		echo "Usage: "$0" github [Github repo] [Release title] [Assets name (include .difypkg suffix)]"
 		echo "Example:"
-		echo "	"$0" github junjiem/dify-plugin-tools-dbquery v0.0.2 db_query.difypkg"
-		echo "	"$0" github https://github.com/junjiem/dify-plugin-agent-mcp_sse 0.0.1 agent-mcp_see.difypkg"
+		echo "\t"$0" github junjiem/dify-plugin-tools-dbquery v0.0.2 db_query.difypkg"
+		echo "\t"$0" github https://github.com/junjiem/dify-plugin-agent-mcp_sse 0.0.1 agent-mcp_see.difypkg"
 		echo ""
 		exit 1
 	fi
@@ -114,8 +114,8 @@ _local(){
 		echo ""
 		echo "Usage: "$0" local [difypkg path]"
 		echo "Example:"
-		echo "	"$0" local ./db_query.difypkg"
-		echo "	"$0" local /root/dify-plugin/db_query.difypkg"
+		echo "\t"$0" local ./db_query.difypkg"
+		echo "\t"$0" local /root/dify-plugin/db_query.difypkg"
 		echo ""
 		exit 1
 	fi
@@ -150,6 +150,51 @@ repackage(){
 	if [ ! -f "pyproject.toml" ] && [ ! -f "requirements.txt" ]; then
 		echo "⚠ Warning: No pyproject.toml or requirements.txt found"
 	fi
+
+	# Remove development-only dependency groups before uv resolves the plugin.
+	# Dify plugin-daemon can still consider dependency-groups during offline
+	# solving even when the runtime command uses `uv sync --no-dev`.
+	strip_dependency_groups() {
+		local PYFILE="$1"
+		[ -f "$PYFILE" ] || return 0
+
+		if ! grep -qE '^[[:space:]]*\[dependency-groups\][[:space:]]*$' "$PYFILE"; then
+			return 0
+		fi
+
+		echo "Removing [dependency-groups] from $PYFILE for offline runtime..."
+		python3 - "$PYFILE" <<'PYEOF'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines(keepends=True)
+out = []
+inside_dependency_groups = False
+
+for line in lines:
+    stripped = line.strip()
+
+    if re.fullmatch(r"\[dependency-groups\]", stripped):
+        inside_dependency_groups = True
+        continue
+
+    # Any new TOML table ends [dependency-groups].
+    if inside_dependency_groups and re.match(r"^\s*\[", line):
+        inside_dependency_groups = False
+
+    if not inside_dependency_groups:
+        out.append(line)
+
+path.write_text("".join(out))
+PYEOF
+		if [[ $? -ne 0 ]]; then
+			echo "✗ Error: Failed to remove [dependency-groups] from $PYFILE"
+			exit 1
+		fi
+		echo "✓ Removed [dependency-groups]"
+	}
 
 	# Inject [tool.uv] config into pyproject.toml (runtime will use local wheels offline)
 	inject_uv_into_pyproject() {
@@ -283,9 +328,10 @@ PY
 	echo "Step 2: Processing dependencies"
 	echo "=========================================="
 
-	# Inject [tool.uv] config to enable offline wheel usage
+	# Prepare pyproject.toml for a runtime-only, offline uv environment.
 	if [ -f "pyproject.toml" ]; then
-		echo "Found pyproject.toml, injecting [tool.uv] configuration..."
+		echo "Found pyproject.toml, preparing for offline runtime..."
+		strip_dependency_groups "pyproject.toml"
 		inject_uv_into_pyproject "pyproject.toml"
 	fi
 
@@ -339,7 +385,7 @@ PY
 		if is_native_target; then
 			echo "⚠ Prebuilt wheels are unavailable for one or more dependencies."
 			echo "Building missing dependencies from source on the native platform..."
-			# 清除 pip 的平台环境变量，避免源码构建被误判为交叉编译。
+			# Clear pip platform env vars so source builds are not treated as cross-compilation.
 			env -u PIP_PLATFORM ${PIP_CMD} wheel --wheel-dir ./wheels --prefer-binary -r requirements.txt \
 				--index-url ${PIP_MIRROR_URL} --trusted-host mirrors.aliyun.com
 			if [[ $? -ne 0 ]]; then
@@ -376,12 +422,21 @@ PY
 	fi
 	echo "✓ requirements.txt updated for offline mode"
 
+	# uv.lock can contain PyPI source metadata/URLs and may cause the daemon to
+	# re-resolve dependency groups. The offline package should resolve only from
+	# the bundled wheels and the sanitized pyproject.toml.
+	if [ -f "uv.lock" ]; then
+		echo "Removing uv.lock for offline runtime..."
+		rm -f uv.lock
+		echo "✓ uv.lock removed"
+	fi
+
 	# ============================================
 	# Step 5: Package the plugin
 	# ============================================
 	echo ""
 	echo "=========================================="
-	echo "Step 4: Packaging plugin"
+	echo "Step 5: Packaging plugin"
 	echo "=========================================="
 
 	cd ${CURR_DIR} || exit 1
@@ -481,8 +536,8 @@ case "$1" in
 	_local $@
 	;;
 	*)
-
-print_usage
-exit 1
+	print_usage
+	exit 1
+	;;
 esac
 exit 0
